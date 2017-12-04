@@ -45,13 +45,14 @@ typedef double T;
 
 
 // Parameters for the simulation setup
-const int maxIter  = 10000;
-const int nx   = 201;
-const int ny   = 201;
+const int maxIter  = 5000;
+const int nx   = 100;
+const int ny   = 100;
 
 
 // Stores geometry information in form of material numbers
-void prepareGeometry( SuperGeometry2D<T>& superGeometry ) {
+void prepareGeometry(LBconverter<T> const& converter, 
+							SuperGeometry2D<T>& superGeometry ) {
 
   OstreamManager clout( std::cout,"prepareGeometry" );
   clout << "Prepare Geometry ..." << std::endl;
@@ -59,10 +60,18 @@ void prepareGeometry( SuperGeometry2D<T>& superGeometry ) {
   // Sets material number for fluid
   superGeometry.rename( 0,1 );
 
+  // Vectors for Geometry Settings
+  Vector<T, 2> origin1(-.5, -.5);
+  Vector<T, 2> extend1(.5 + nx, .5+ny/2);
+
+  //Indicator functors
+  IndicatorCuboid2D<T> bottom(extend1, origin1);
+  superGeometry.rename(1, 2, bottom);
+
   // Removes all not needed boundary voxels outside the surface
-  superGeometry.clean();
+  //superGeometry.clean();
   // Removes all not needed boundary voxels inside the surface
-  superGeometry.innerClean();
+  //superGeometry.innerClean();
   superGeometry.checkForErrors();
 
   superGeometry.print();
@@ -71,37 +80,65 @@ void prepareGeometry( SuperGeometry2D<T>& superGeometry ) {
 }
 
 // Set up the geometry of the simulation
-void prepareLattice( SuperLattice2D<T, DESCRIPTOR>& sLattice,
+void prepareLattice(LBconverter<T> const& converter,
+							SuperLattice2D<T, DESCRIPTOR>& sLattice,
                      Dynamics<T, DESCRIPTOR>& bulkDynamics1,
                      SuperGeometry2D<T>& superGeometry ) {
+	//Dynamics 0
+	sLattice.defineDynamics(superGeometry, 0, &instances::getNoDynamics<T, DESCRIPTOR>());
 
-  // Material=1 -->bulk dynamics
+  //BulkDynamics
   sLattice.defineDynamics( superGeometry, 1, &bulkDynamics1 );
+  sLattice.defineDynamics(superGeometry, 2, &bulkDynamics1);
 
   // Initial conditions
-  AnalyticalConst2D<T,T> noise( 2. );
+  //AnalyticalConst2D<T,T> noise( 2. );
   std::vector<T> v( 2,T() );
   AnalyticalConst2D<T,T> zeroVelocity( v );
-  AnalyticalConst2D<T,T> oldRho( 199. );
+  //AnalyticalConst2D<T,T> rhoUpper( 2.659 ); //werte aus timm krüger S375
+  AnalyticalConst2D<T, T> rhoUpper(8.);
+  //AnalyticalConst2D<T, T> rhoBottom(.056);
+  AnalyticalConst2D<T, T> rhoBottom(.1);
   AnalyticalRandom2D<T,T> random;
-  AnalyticalIdentity2D<T,T> newRho( random*noise+oldRho );
+  AnalyticalIdentity2D<T,T> upper(rhoUpper );
+  AnalyticalIdentity2D<T, T> bottom(rhoBottom);
+
+  //just a test
 
   // Initialize all values of distribution functions to their local equilibrium
-  sLattice.defineRhoU( superGeometry, 1, newRho, zeroVelocity );
-  sLattice.iniEquilibrium( superGeometry, 1, newRho, zeroVelocity );
+  sLattice.defineRhoU( superGeometry, 1, upper, zeroVelocity );
+  sLattice.iniEquilibrium( superGeometry, 1, upper, zeroVelocity );
+  sLattice.defineRhoU(superGeometry, 2, bottom, zeroVelocity);
+  sLattice.iniEquilibrium(superGeometry, 2, bottom, zeroVelocity);
 
   // Make the lattice ready for simulation
   sLattice.initialize();
 }
 
+void saveRhoEq(double fluid, double vapor) {
+	//Create a file object
+	ofstream rhoEq;
+	//Open the file
+	rhoEq.open("rhoEq.txt", ios_base::out | ios_base::app);
+	//Error handling
+	if (!rhoEq) {
+		cerr << "Fehler im File eqRho" << endl;
+		getchar();
+	}
+	rhoEq << fluid << "," << vapor << "\n" << endl;
+	//Close the file
+	rhoEq.close();
+}
+
 // Output to console and files
-void getResults( SuperLattice2D<T, DESCRIPTOR>& sLattice, int iT,
-                 SuperGeometry2D<T>& superGeometry, Timer<T>& timer ) {
+void getResults( SuperLattice2D<T, DESCRIPTOR>& sLattice, 
+						LBconverter<T> const& converter, int iT,
+						SuperGeometry2D<T>& superGeometry, Timer<T>& timer) {
 
   OstreamManager clout( std::cout,"getResults" );
 
   SuperVTMwriter2D<T> vtmWriter( "phaseSeparation2d" );
-  SuperLatticeVelocity2D<T, DESCRIPTOR> velocity( sLattice );
+  SuperLatticePhysVelocity2D<T, DESCRIPTOR> velocity(sLattice, converter);
   SuperLatticeDensity2D<T, DESCRIPTOR> density( sLattice );
   vtmWriter.addFunctor( velocity );
   vtmWriter.addFunctor( density );
@@ -138,8 +175,47 @@ void getResults( SuperLattice2D<T, DESCRIPTOR>& sLattice, int iT,
     timer.printStep();
 
     // Lattice statistics console output
-    sLattice.getStatistics().print( iT,iT );
+    sLattice.getStatistics().print( iT, converter.physTime(iT));
   }
+
+  /***********************************/
+  // Output for x-velocity along y-position at the last time step
+  if (iT == maxIter - 1) {
+	  // Gives access to density information on lattice in lattice units
+	  SuperLatticeDensity2D<T, DESCRIPTOR> densityField(sLattice);
+	  // Interpolation functor with densityField information - Ist das nötig ???
+	  AnalyticalFfromSuperLatticeF2D<T, DESCRIPTOR> interpolation(densityField, true);
+
+	  //Vector for density_simulation
+	  Vector<T, nx> density_simulation;
+	  // Gnuplot interface to create plots
+	  static Gnuplot<T> gplot("interfaceTest_");
+	  for (int nY = 0; nY < nx; ++nY) {
+
+		  T position[2] = { 50, nY / 1. }; 
+		  T density[2] = { T(), T() }; 
+			// Interpolate densityField at "position" and save it in "density"
+		  interpolation(density, position);
+		  // y-values: value of density (in x-direction) in "density_simulation" for every position "nY"
+		  density_simulation[nY] = density[0];
+		  //Extract density of the fluid an of the vapor
+		  double vapor;
+		  double fluid;
+		  if (nY == 5) {
+			  fluid = density_simulation[nY];
+		  }
+		  if (nY == nx / 2) {
+			  vapor = density_simulation[nY];
+		  }
+		  if (nY == nx - 1) {
+			  saveRhoEq(fluid, vapor);
+		  }
+		  // Set data for plot output
+		  gplot.setData(position[1], density_simulation[nY], { "simulated" });
+	  }
+	  // Create PNG file
+	  gplot.writePNG();
+  }//end if
 }
 
 int main( int argc, char *argv[] ) {
@@ -151,8 +227,23 @@ int main( int argc, char *argv[] ) {
   // display messages from every single mpi process
   //clout.setMultiOutput(true);
 
-  const T omega1 = 1.0;
-  const T G      = -120.;
+	//converter----------------------------------------------
+	LBconverter<T> converter(
+	( int )	2,										//dim
+	( T )		1./ nx,								//latticeL
+	( T )		0.1,									//latticeU,
+	( T )		1.16 *	pow(10, -7),			//charNu ??
+	( T )		0.03,									//charL = 1,
+	( T )		6.96*pow(10, -6),					//charU = 1,	
+	( T )		107.									//	charRho
+	);
+	converter.print();
+	writeLogFile(converter, "phaseSeperation");
+
+	//const T omega1 = converter.getOmega();
+	const T G      = -6;
+	//const T G = -0.0649; //für T = 606,14K
+	// const T omega1 = converter.getOmega();
 
   // === 2rd Step: Prepare Geometry ===
 
@@ -173,31 +264,46 @@ int main( int argc, char *argv[] ) {
   // Instantiation of a superGeometry
   SuperGeometry2D<T> superGeometry( cuboidGeometry,loadBalancer,2 );
 
-  prepareGeometry( superGeometry );
+  prepareGeometry( converter, superGeometry );
 
   // === 3rd Step: Prepare Lattice ===
   SuperLattice2D<T, DESCRIPTOR> sLattice( superGeometry );
 
   ForcedShanChenBGKdynamics<T, DESCRIPTOR> bulkDynamics1 (
-    omega1, instances::getExternalVelocityMomenta<T,DESCRIPTOR>() );
+    converter.getOmega(), instances::getExternalVelocityMomenta<T,DESCRIPTOR>() );
 
   std::vector<T> rho0;
   rho0.push_back( 1 );
   rho0.push_back( 1 );
-  ShanChen94<T,T> interactionPotential;
+  //ShanChen93<T,T> interactionPotential;
+  
+  PengRobinson<T, T> interactionPotential(G);
+  //hier PengRobinson
   ShanChenForcedSingleComponentGenerator2D<T,DESCRIPTOR> coupling( G,rho0,interactionPotential );
 
   sLattice.addLatticeCoupling( superGeometry, 1, coupling, sLattice );
+  sLattice.addLatticeCoupling(superGeometry, 2, coupling, sLattice);
 
-  prepareLattice( sLattice, bulkDynamics1, superGeometry );
+  prepareLattice( converter, sLattice, bulkDynamics1, superGeometry );
 
   // === 4th Step: Main Loop ===
+  //Konvergenzkriterium
+  //T interval = 20;
+  //T epsilon = 0.01;
+  //util::ValueTracer<T> converge(interval, epsilon);
+
   int iT = 0;
   clout << "starting simulation..." << endl;
-  Timer<T> timer( maxIter, superGeometry.getStatistics().getNvoxel() );
+  Timer<T> timer(maxIter, superGeometry.getStatistics().getNvoxel());
   timer.start();
+  for (iT = 0; iT < maxIter; ++iT) {
 
-  for ( iT = 0; iT < maxIter; ++iT ) {
+	  //Falls System konvergiert
+	  //if (converge.hasConverged()) {
+		 // clout << "Simulation converged." << endl;
+		 // getResults(sLattice, converter, iT, superGeometry, timer, converge.hasConverged()); //hier
+		 // break;
+	  //}
 
     // === 5th Step: Definition of Initial and Boundary Conditions ===
     // in this application no boundary conditions have to be adjusted
@@ -208,7 +314,8 @@ int main( int argc, char *argv[] ) {
     sLattice.executeCoupling();
 
     // === 7th Step: Computation and Output of the Results ===
-    getResults( sLattice, iT, superGeometry, timer );
+    getResults( sLattice, converter, iT, superGeometry, timer);
+	 //converge.takeValue(sLattice.getStatistics().getAverageEnergy(), true);
   }
 
   timer.stop();
